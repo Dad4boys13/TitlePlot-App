@@ -83,7 +83,7 @@ def fetch_parcel_geometry(apn: str, county: Optional[str] = None) -> ParcelGeome
     apn_variants = {apn, apn.replace("-", ""), apn.replace(" ", "")}
     for candidate in apn_variants:
         params = {
-            "where": f"APN='{candidate}'",
+            "where": f"PARCEL_APN='{candidate}'",
             "outFields": "*",
             "f": "geojson",
         }
