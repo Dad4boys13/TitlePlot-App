@@ -1,3 +1,4 @@
+
 """
 Parcel geometry lookup.
 
@@ -87,9 +88,16 @@ def fetch_parcel_geometry(apn: str, county: Optional[str] = None) -> ParcelGeome
             "f": "geojson",
         }
         try:
-            resp = requests.get(DWR_STATEWIDE_LAYER, params=params, timeout=15)
+            resp = requests.get(DWR_STATEWIDE_LAYER, params=params, timeout=45)
             resp.raise_for_status()
             data = resp.json()
+        except requests.Timeout:
+            raise ValueError(
+                "GIS lookup timed out after 45s. The statewide DWR layer may be "
+                "slow for unfiltered APN queries at scale -- consider adding a "
+                "county-specific filter/source, or a background job + cache "
+                "instead of a synchronous request-time lookup."
+            )
         except requests.RequestException as e:
             raise ValueError(f"GIS lookup failed (network/service error): {e}")
 
