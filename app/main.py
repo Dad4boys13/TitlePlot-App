@@ -2,7 +2,7 @@ from fastapi import FastAPI, UploadFile, File, HTTPException, Form
 from fastapi.responses import Response
 from typing import Optional
 
-from .gis_client import fetch_parcel_geometry
+from .gis_client import fetch_parcel_geometry_by_address
 from .pdf_ingest import extract_hyperlinks, extract_text
 from .schedule_b_parser import parse_schedule_b
 from .renderer import render_plat_svg
@@ -17,9 +17,15 @@ def health():
 
 
 @app.get("/parcels/lookup", response_model=ParcelGeometry)
-def parcel_lookup(apn: str, county: Optional[str] = None):
+def parcel_lookup(address: str, apn: Optional[str] = None):
+    """
+    NOTE: switched from APN attribute lookup (confirmed broken -- times
+    out, no index on that field in the statewide layer) to geocode +
+    spatial lookup by address. `apn`, if provided, is used only as a
+    cross-check against the parcel found at that address.
+    """
     try:
-        return fetch_parcel_geometry(apn, county)
+        return fetch_parcel_geometry_by_address(address, expected_apn=apn)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
 
@@ -41,22 +47,21 @@ async def parse_report(file: UploadFile = File(...)):
 
 @app.post("/plats/build")
 async def build_plat(
-    apn: str = Form(...),
-    county: Optional[str] = Form(None),
+    address: str = Form(...),
+    apn: Optional[str] = Form(None),
     front_compass: str = Form("N"),
     file: UploadFile = File(...),
 ):
     """
-    End-to-end: given an APN and the prelim report PDF, fetch real
-    parcel geometry from GIS, parse Schedule B, and render the plat.
-    Returns SVG directly (image/svg+xml) for easy preview; swap for a
-    JSON envelope with a stored file URL once this is wired to real
-    storage/a frontend.
+    End-to-end: given the property address (and optionally its APN as a
+    cross-check) plus the prelim report PDF, fetch real parcel geometry
+    via geocode + spatial GIS lookup, parse Schedule B, and render the
+    plat. Returns SVG directly (image/svg+xml).
     """
     pdf_bytes = await file.read()
 
     try:
-        geometry = fetch_parcel_geometry(apn, county)
+        geometry = fetch_parcel_geometry_by_address(address, expected_apn=apn)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=f"Parcel geometry: {e}")
 

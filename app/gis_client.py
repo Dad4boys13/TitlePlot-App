@@ -3,18 +3,21 @@
 Parcel geometry lookup.
 
 Primary source: the CA Dept. of Water Resources statewide assessor
-parcel layer (i15_Parcels_Assessor_Lightbox), which is public and
-covers all 58 counties. This was verified reachable and queryable
-from a normal internet connection (see README) -- it could NOT be
-tested from the dev sandbox that first wrote this code, since that
-sandbox has no network egress. TEST THIS FIRST after deploying,
-before trusting it for real parcels.
+parcel layer (i15_Parcels_Assessor_Lightbox), covering all 58 counties.
 
-Fallback slots are structured in for county-specific authoritative
-sources (e.g. Orange County's OC Landbase, which is derived from
-recorded legal documents rather than assessor rolls and would be a
-better source of truth where available) -- add these per-county as
-you validate them.
+IMPORTANT, learned the hard way: filtering this layer by APN (even with
+the correct field name, PARCEL_APN) times out. The service's own schema
+shows only two indexes -- one on OBJECTID, one spatial index on SHAPE.
+There is NO index on PARCEL_APN, so an attribute filter forces a full
+scan across every parcel in California and gets rejected under load
+(503 "Wait timeout for the request exceeded").
+
+The fix: use the index that actually exists. Geocode the property
+address to a lat/lon first (free, via the US Census geocoder), then run
+a SPATIAL query (point-in-polygon) against this layer, which uses the
+SHAPE index and should be fast regardless of table size. The returned
+feature's PARCEL_APN is then used to cross-check against the expected
+APN as a sanity check, not as the query key.
 """
 import math
 from typing import Optional
@@ -25,6 +28,10 @@ from .models import ParcelGeometry
 DWR_STATEWIDE_LAYER = (
     "https://gis.water.ca.gov/arcgis/rest/services/"
     "Planning/i15_Parcels_Assessor_Lightbox/MapServer/0/query"
+)
+
+CENSUS_GEOCODER = (
+    "https://geocoding.geo.census.gov/geocoder/locations/onelineaddress"
 )
 
 # Register county-specific higher-quality sources here as they're
@@ -68,10 +75,96 @@ def _lonlat_ring_to_local_feet(ring):
     return pts
 
 
+def geocode_address(address: str):
+    """
+    Free, no-API-key geocoder (US Census Bureau), US addresses only.
+    Returns (lon, lat) or raises ValueError if no match.
+    """
+    params = {
+        "address": address,
+        "benchmark": "Public_AR_Current",
+        "format": "json",
+    }
+    try:
+        resp = requests.get(CENSUS_GEOCODER, params=params, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+    except requests.RequestException as e:
+        raise ValueError(f"Geocoding failed (network/service error): {e}")
+
+    matches = data.get("result", {}).get("addressMatches", [])
+    if not matches:
+        raise ValueError(f"Could not geocode address: '{address}'")
+
+    coords = matches[0]["coordinates"]
+    return coords["x"], coords["y"]  # lon, lat
+
+
+def fetch_parcel_geometry_by_address(
+    address: str, expected_apn: Optional[str] = None
+) -> ParcelGeometry:
+    """
+    Geocode the address, then run a spatial (point-in-polygon) query
+    against the statewide parcel layer -- this uses the layer's actual
+    spatial index, unlike an APN attribute filter (see module docstring).
+    """
+    lon, lat = geocode_address(address)
+
+    params = {
+        "geometry": f"{lon},{lat}",
+        "geometryType": "esriGeometryPoint",
+        "inSR": 4326,
+        "spatialRel": "esriSpatialRelIntersects",
+        "outFields": "*",
+        "f": "geojson",
+    }
+    try:
+        resp = requests.get(DWR_STATEWIDE_LAYER, params=params, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+    except requests.Timeout:
+        raise ValueError(
+            "GIS spatial lookup timed out after 30s -- unexpected, since "
+            "this query should use the layer's spatial index. Investigate "
+            "further before assuming this data source is unusable."
+        )
+    except requests.RequestException as e:
+        raise ValueError(f"GIS lookup failed (network/service error): {e}")
+
+    features = data.get("features", [])
+    if not features:
+        raise ValueError(
+            f"No parcel found containing the geocoded point for '{address}' "
+            f"({lon}, {lat}). The point may have geocoded slightly outside "
+            "the actual parcel boundary -- consider a small search buffer."
+        )
+
+    feature = features[0]
+    geometry = _feature_to_geometry(
+        feature.get("properties", {}).get("PARCEL_APN", expected_apn or "unknown"),
+        feature,
+        "dwr_statewide_lightbox_spatial",
+    )
+
+    if expected_apn:
+        found_apn = feature.get("properties", {}).get("PARCEL_APN", "")
+        if found_apn and found_apn.replace("-", "") != expected_apn.replace("-", ""):
+            geometry.confidence_notes = (
+                f"{geometry.confidence_notes} WARNING: expected APN "
+                f"'{expected_apn}' but the parcel found at this address is "
+                f"APN '{found_apn}' -- verify the address/APN match."
+            )
+
+    return geometry
+
+
 def fetch_parcel_geometry(apn: str, county: Optional[str] = None) -> ParcelGeometry:
     """
-    Look up a parcel's boundary geometry by APN.
-    Raises ValueError if nothing is found or the service is unreachable.
+    DEPRECATED PATH: attribute-based APN lookup. Confirmed via testing
+    that this times out (503) against the statewide layer regardless of
+    correct field name, because PARCEL_APN has no index. Kept only for
+    county overrides that might support it efficiently; the real lookup
+    path is fetch_parcel_geometry_by_address(). Raises ValueError.
     """
     if county and county in COUNTY_OVERRIDES:
         feature = COUNTY_OVERRIDES[county](apn)
@@ -79,35 +172,11 @@ def fetch_parcel_geometry(apn: str, county: Optional[str] = None) -> ParcelGeome
         if feature:
             return _feature_to_geometry(apn, feature, source)
 
-    # normalize common APN formatting differences (dashes/spaces)
-    apn_variants = {apn, apn.replace("-", ""), apn.replace(" ", "")}
-    for candidate in apn_variants:
-        params = {
-            "where": f"PARCEL_APN='{candidate}'",
-            "outFields": "*",
-            "f": "geojson",
-        }
-        try:
-            resp = requests.get(DWR_STATEWIDE_LAYER, params=params, timeout=45)
-            resp.raise_for_status()
-            data = resp.json()
-        except requests.Timeout:
-            raise ValueError(
-                "GIS lookup timed out after 45s. The statewide DWR layer may be "
-                "slow for unfiltered APN queries at scale -- consider adding a "
-                "county-specific filter/source, or a background job + cache "
-                "instead of a synchronous request-time lookup."
-            )
-        except requests.RequestException as e:
-            raise ValueError(f"GIS lookup failed (network/service error): {e}")
-
-        features = data.get("features", [])
-        if features:
-            return _feature_to_geometry(apn, features[0], "dwr_statewide_lightbox")
-
     raise ValueError(
-        f"No parcel found for APN '{apn}' in the statewide layer. "
-        "Try a county-specific source, or fall back to manual/approximate geometry."
+        "Attribute-based APN lookup against the statewide layer is known "
+        "to time out (no index on PARCEL_APN). Use "
+        "fetch_parcel_geometry_by_address(address, expected_apn=apn) "
+        "instead."
     )
 
 
